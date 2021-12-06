@@ -3,11 +3,20 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from keras.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from keras.layers import Dense, Input, Multiply
-from keras.layers import Embedding, Reshape, Dot, Concatenate, Dropout, Dense, merge, dot
+from keras.layers import Embedding, Reshape, Dot, Concatenate, Dropout, Dense, merge, dot, Flatten
 from keras.models import Model
 import numpy as np
+from keras import backend as K
+from keras.optimizers import adam_v2
 
-def get_model(n_users, n_items, dim):
+RATINGS_CSV_FILE = 'ml1m_ratings.csv'
+MODEL_WEIGHTS_FILE = 'ml1m_weights.h5'
+LIBSVM_FILE= 'ml1m'
+K_FACTORS = 60
+RNG_SEED = 1446557
+use_bpr = False
+
+def get_mf_model(n_users, n_items, dim):
     user_id = Input(shape=(1,))
     item_id = Input(shape=(1,))
     user_emb = Embedding(n_users, dim, input_length=1)(user_id)
@@ -15,13 +24,39 @@ def get_model(n_users, n_items, dim):
     pred = Dot(axes=-1)([user_emb, item_emb])
     dot_emb = Multiply()([user_emb, item_emb])
     emb = Concatenate(axis=-1)([user_emb, item_emb, dot_emb])
-    return Model([user_id,item_id],pred), Model([user_id,item_id],emb)
+    train_model = Model([user_id,item_id],pred)
+    train_model.compile(loss='mse', optimizer='adamax')
+    return train_model, Model([user_id,item_id],emb)
 
-RATINGS_CSV_FILE = 'ml1m_ratings.csv'
-MODEL_WEIGHTS_FILE = 'ml1m_weights.h5'
-LIBSVM_FILE= 'ml1m'
-K_FACTORS = 60
-RNG_SEED = 1446557
+def identity_loss(y_true, y_pred):
+    return K.mean(y_pred)
+
+def bpr_triplet_loss(X):
+    positive_item_latent, negative_item_latent, user_latent = X
+
+    # BPR loss
+    loss = 1.0 - K.sigmoid(
+        K.sum(user_latent * positive_item_latent, axis=-1, keepdims=True) -
+        K.sum(user_latent * negative_item_latent, axis=-1, keepdims=True))
+
+    return loss
+
+def get_bpr_model(n_users, n_items, dim):
+    user_id = Input(shape=(1,))
+    item_id = Input(shape=(1,))
+    neg_item_id = Input(shape=(1,))
+    user_emb = Embedding(n_users, dim, input_length=1)(user_id)
+    item_emb_layer = Embedding(n_items, dim, input_length=1)
+    item_emb = item_emb_layer(item_id)
+    neg_item_emb = item_emb_layer(neg_item_id)    
+    loss = bpr_triplet_loss((Flatten()(item_emb), Flatten()(neg_item_emb), Flatten()(user_emb)))
+
+    dot_emb = Multiply()([user_emb, item_emb])
+    emb = Concatenate(axis=-1)([user_emb, item_emb, dot_emb])
+    train_model = Model([user_id,item_id,neg_item_id],loss)
+    train_model.compile(loss=identity_loss, optimizer='adamax')
+    return train_model, Model([user_id,item_id],emb)
+
 ratings = pd.read_csv(RATINGS_CSV_FILE, 
                       sep='\t', 
                       encoding='latin-1', 
@@ -51,13 +86,24 @@ vali_part = pd.concat(vali_df)
 test_part = pd.concat(test_df)
 
 print (len(ratings), 'ratings loaded.')
-shuffled_ratings = train_part.sample(frac=1., random_state=RNG_SEED)
-Users = shuffled_ratings['user_emb_id'].values
+#shuffled_ratings = train_part.sample(frac=1., random_state=RNG_SEED)
+Users = train_part['user_emb_id'].values
 print ('Train Users:', Users, ', shape =', Users.shape)
-Movies = shuffled_ratings['movie_emb_id'].values
+Movies = train_part['movie_emb_id'].values
 print ('Train Movies:', Movies, ', shape =', Movies.shape)
-Ratings = shuffled_ratings['rating'].values
+Ratings = train_part['rating'].values
 print ('Train Ratings:', Ratings, ', shape =', Ratings.shape)
+
+train_df = train_part
+train_df = train_df.loc[train_df['rating'] > 2]
+PosUsers = train_df['user_emb_id'].values
+print ('Train PosUsers:', PosUsers, ', shape =', PosUsers.shape)
+PosMovies = train_df['movie_emb_id'].values
+print ('Train PosMovies:', PosMovies, ', shape =', PosMovies.shape)
+NegMovies = np.random.choice(max_movieid, len(PosMovies))
+print ('Train NegMovies:', NegMovies, ', shape =', NegMovies.shape)
+PosRatings = train_df['rating'].values
+print ('Train PosRatings:', PosRatings, ', shape =', PosRatings.shape)
 
 ValiUsers = vali_part['user_emb_id'].values
 print ('vali Users:', Users, ', shape =', ValiUsers.shape)
@@ -66,6 +112,17 @@ print ('vali Movies:', Movies, ', shape =', ValiMovies.shape)
 ValiRatings = vali_part['rating'].values
 print ('vali Ratings:', Ratings, ', shape =', ValiRatings.shape)
 
+vali_df = vali_part
+vali_df = vali_df.loc[vali_df['rating'] > 2]
+ValiPosUsers = vali_df['user_emb_id'].values
+print ('Vali PosUsers:', ValiPosUsers, ', shape =', ValiPosUsers.shape)
+ValiPosMovies = vali_df['movie_emb_id'].values
+print ('Vali PosMovies:', ValiPosMovies, ', shape =', ValiPosMovies.shape)
+ValiNegMovies = np.random.choice(max_movieid, len(ValiPosMovies))
+print ('Vali NegMovies:', ValiNegMovies, ', shape =', ValiNegMovies.shape)
+ValiPosRatings = vali_df['rating'].values
+print ('Vali PosRatings:', ValiPosRatings, ', shape =', ValiPosRatings.shape)
+
 TestUsers = test_part['user_emb_id'].values
 print ('test Users:', Users, ', shape =', TestUsers.shape)
 TestMovies = test_part['movie_emb_id'].values
@@ -73,21 +130,19 @@ print ('test Movies:', Movies, ', shape =', TestMovies.shape)
 TestRatings = test_part['rating'].values
 print ('test Ratings:', Ratings, ', shape =', TestRatings.shape)
 
-model, emb_model = get_model(max_userid, max_movieid, K_FACTORS)
-
-model.compile(loss='mse', optimizer='adamax')
 callbacks = [EarlyStopping('val_loss', patience=2), 
              ModelCheckpoint(MODEL_WEIGHTS_FILE, save_best_only=True)]
-history = model.fit([Users, Movies], Ratings, epochs=30, 
-                    validation_data=([ValiUsers,ValiMovies], ValiRatings),
-                    validation_split=0, verbose=2, callbacks=callbacks)
 
-Users = train_part['user_emb_id'].values
-print ('Users:', Users, ', shape =', Users.shape)
-Movies = train_part['movie_emb_id'].values
-print ('Movies:', Movies, ', shape =', Movies.shape)
-Ratings = train_part['rating'].values
-print ('Ratings:', Ratings, ', shape =', Ratings.shape)
+if use_bpr:
+    model, emb_model = get_bpr_model(max_userid, max_movieid, K_FACTORS)
+    history = model.fit([PosUsers, PosMovies, NegMovies], PosRatings, epochs=30, 
+                    validation_data=([ValiPosUsers,ValiPosMovies,ValiNegMovies], ValiPosRatings),
+                    validation_split=0, verbose=2, callbacks=callbacks, shuffle=True)
+else:
+    model, emb_model = get_mf_model(max_userid, max_movieid, K_FACTORS)
+    history = model.fit([Users, Movies], Ratings, epochs=30, 
+                    validation_data=([ValiUsers,ValiMovies], ValiRatings),
+                    validation_split=0, verbose=2, callbacks=callbacks, shuffle=True)
 
 def writeRecord(f, Users, Ratings, emb, i):
     uid = str(Users[i])
